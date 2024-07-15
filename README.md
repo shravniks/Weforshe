@@ -1,1 +1,2 @@
 # Weforshe
+Our project aims to analyse the current trends in the fashion industry as well as the social media trends based on the current events and then based on this data we use a gan model to generate images based on those trending topics. Then we integrate those generated images and trends in social media nad then promote those trends by help of influencers. Then below those trends that the influencers make we will integrate shopable posts of myntra products related to that trend to encourage the viewers to buy those.
