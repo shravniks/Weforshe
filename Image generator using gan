@@ -1,0 +1,162 @@
+
+import numpy as np
+import tensorflow as tf
+from tensorflow.keras.layers import Dense, Flatten, Reshape, Conv2D, Conv2DTranspose, LeakyReLU, BatchNormalization
+from tensorflow.keras.models import Sequential
+from tensorflow.keras.optimizers import Adam
+import matplotlib.pyplot as plt
+import os
+import clip
+import torch
+from PIL import Image
+
+# Load Fashion MNIST dataset
+(train_images, train_labels), (test_images, test_labels) = tf.keras.datasets.fashion_mnist.load_data()
+
+# Normalize the images to [-1, 1]
+train_images = (train_images - 127.5) / 127.5
+train_images = train_images.reshape(train_images.shape[0], 28, 28, 1)
+
+BUFFER_SIZE = 60000
+BATCH_SIZE = 256
+
+# Create batches of training data
+train_dataset = tf.data.Dataset.from_tensor_slices(train_images).shuffle(BUFFER_SIZE).batch(BATCH_SIZE)
+
+# Generator model
+def build_generator():
+    model = Sequential()
+    model.add(Dense(7*7*256, use_bias=False, input_shape=(100,)))
+    model.add(BatchNormalization())
+    model.add(LeakyReLU())
+    model.add(Reshape((7, 7, 256)))
+    model.add(Conv2DTranspose(128, (5, 5), strides=(1, 1), padding='same', use_bias=False))
+    model.add(BatchNormalization())
+    model.add(LeakyReLU())
+    model.add(Conv2DTranspose(64, (5, 5), strides=(2, 2), padding='same', use_bias=False))
+    model.add(BatchNormalization())
+    model.add(LeakyReLU())
+    model.add(Conv2DTranspose(1, (5, 5), strides=(2, 2), padding='same', use_bias=False, activation='tanh'))
+    return model
+
+# Discriminator model
+def build_discriminator():
+    model = Sequential()
+    model.add(Conv2D(64, (5, 5), strides=(2, 2), padding='same', input_shape=[28, 28, 1]))
+    model.add(LeakyReLU())
+    model.add(Dropout(0.3))
+    model.add(Conv2D(128, (5, 5), strides=(2, 2), padding='same'))
+    model.add(LeakyReLU())
+    model.add(Dropout(0.3))
+    model.add(Flatten())
+    model.add(Dense(1))
+    return model
+
+# Loss function
+cross_entropy = tf.keras.losses.BinaryCrossentropy(from_logits=True)
+
+def discriminator_loss(real_output, fake_output):
+    real_loss = cross_entropy(tf.ones_like(real_output), real_output)
+    fake_loss = cross_entropy(tf.zeros_like(fake_output), fake_output)
+    total_loss = real_loss + fake_loss
+    return total_loss
+
+def generator_loss(fake_output):
+    return cross_entropy(tf.ones_like(fake_output), fake_output)
+
+generator = build_generator()
+discriminator = build_discriminator()
+
+generator_optimizer = Adam(1e-4)
+discriminator_optimizer = Adam(1e-4)
+
+# Checkpoints to save model
+checkpoint_dir = './training_checkpoints'
+checkpoint_prefix = os.path.join(checkpoint_dir, "ckpt")
+checkpoint = tf.train.Checkpoint(generator_optimizer=generator_optimizer,
+                                 discriminator_optimizer=discriminator_optimizer,
+                                 generator=generator,
+                                 discriminator=discriminator)
+
+EPOCHS = 25
+noise_dim = 100
+num_examples_to_generate = 8
+
+# Seed for generating images
+seed = tf.random.normal([num_examples_to_generate, noise_dim])
+
+# Training function
+@tf.function
+def train_step(images):
+    noise = tf.random.normal([BATCH_SIZE, noise_dim])
+
+    with tf.GradientTape() as gen_tape, tf.GradientTape() as disc_tape:
+        generated_images = generator(noise, training=True)
+        real_output = discriminator(images, training=True)
+        fake_output = discriminator(generated_images, training=True)
+
+        gen_loss = generator_loss(fake_output)
+        disc_loss = discriminator_loss(real_output, fake_output)
+
+    gradients_of_generator = gen_tape.gradient(gen_loss, generator.trainable_variables)
+    gradients_of_discriminator = disc_tape.gradient(disc_loss, discriminator.trainable_variables)
+
+    generator_optimizer.apply_gradients(zip(gradients_of_generator, generator.trainable_variables))
+    discriminator_optimizer.apply_gradients(zip(gradients_of_discriminator, discriminator.trainable_variables))
+
+def train(dataset, epochs):
+    for epoch in range(epochs):
+        for image_batch in dataset:
+            train_step(image_batch)
+
+        generate_and_save_images(generator, epoch + 1, seed)
+        if (epoch + 1) % 15 == 0:
+            checkpoint.save(file_prefix = checkpoint_prefix)
+
+def generate_and_save_images(model, epoch, test_input):
+    predictions = model(test_input, training=False)
+    fig = plt.figure(figsize=(4, 4))
+
+    for i in range(predictions.shape[0]):
+        plt.subplot(4, 4, i+1)
+        plt.imshow(predictions[i, :, :, 0] * 127.5 + 127.5, cmap='gray')
+        plt.axis('off')
+
+    plt.savefig('image_at_epoch_{:04d}.png'.format(epoch))
+    plt.show()
+
+# Train the model
+train(train_dataset, EPOCHS)
+
+# CLIP for text-to-image
+device = "cuda" if torch.cuda.is_available() else "cpu"
+clip_model, preprocess = clip.load("ViT-B/32", device=device)
+
+def text_to_image(prompt, generator, steps=300, lr=0.1):
+    text = clip.tokenize([prompt]).to(device)
+    noise = torch.randn((1, noise_dim), device=device, requires_grad=True)
+
+    optimizer = torch.optim.Adam([noise], lr=lr)
+
+    for i in range(steps):
+        optimizer.zero_grad()
+        generated_image = generator(noise).cpu().detach().numpy()
+        pil_image = Image.fromarray((generated_image[0, :, :, 0] * 127.5 + 127.5).astype(np.uint8))
+        image = preprocess(pil_image).unsqueeze(0).to(device)
+
+        similarity = clip_model(image, text)[0][0]
+        loss = -similarity
+        loss.backward()
+        optimizer.step()
+
+        if i % 50 == 0:
+            print(f'Step {i}, Loss: {loss.item()}')
+
+    return generated_image[0]
+
+# Example usage
+prompt = "a pair of fashion sneakers"
+generated_image = text_to_image(prompt, generator)
+plt.imshow(generated_image[:, :, 0] * 127.5 + 127.5, cmap='gray')
+plt.axis('off')
+plt.show()
